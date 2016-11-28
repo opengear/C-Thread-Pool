@@ -26,11 +26,6 @@
 #define THPOOL_DEBUG 0
 #endif
 
-static volatile int threads_keepalive;
-static volatile int threads_on_hold;
-
-
-
 /* ========================== STRUCTURES ============================ */
 
 
@@ -70,6 +65,8 @@ typedef struct thread{
 
 /* Threadpool */
 typedef struct thpool_{
+	volatile int threads_keepalive;
+	volatile int threads_on_hold;
 	thread**   threads;                  /* pointer to threads        */
 	volatile int num_threads_alive;      /* threads currently alive   */
 	volatile int num_threads_working;    /* threads currently working */
@@ -78,9 +75,9 @@ typedef struct thpool_{
 	jobqueue*  jobqueue_p;               /* pointer to the job queue  */    
 } thpool_;
 
-
-
-
+static pthread_mutex_t threads_global_mtx;
+static int thpool_count = 0;
+static thpool_ **pools;
 
 /* ========================== PROTOTYPES ============================ */
 
@@ -108,12 +105,12 @@ static void  bsem_wait(struct bsem *bsem_p);
 
 /* ========================== THREADPOOL ============================ */
 
+void thpool_global_init () {
+	pthread_mutex_init (&threads_global_mtx, NULL);
+}
 
 /* Initialise thread pool */
 struct thpool_* thpool_init(int num_threads){
-
-	threads_on_hold   = 0;
-	threads_keepalive = 1;
 
 	if (num_threads < 0){
 		num_threads = 0;
@@ -128,6 +125,14 @@ struct thpool_* thpool_init(int num_threads){
 	}
 	thpool_p->num_threads_alive   = 0;
 	thpool_p->num_threads_working = 0;
+	thpool_p->threads_on_hold   = 0;
+	thpool_p->threads_keepalive = 1;
+
+	pthread_mutex_lock (&threads_global_mtx);
+	thpool_count++;
+	pools = (thpool_**) realloc (pools, sizeof (thpool_*) * thpool_count);
+	pools[thpool_count - 1] = thpool_p;
+	pthread_mutex_unlock (&threads_global_mtx);
 
 	/* Initialise the job queue */
 	if (jobqueue_init(thpool_p) == -1){
@@ -158,7 +163,12 @@ struct thpool_* thpool_init(int num_threads){
 	}
 	
 	/* Wait for threads to initialize */
-	while (thpool_p->num_threads_alive != num_threads) {}
+	int count = 0;
+	do {
+		pthread_mutex_lock(&thpool_p->thcount_lock);
+		count = thpool_p->num_threads_alive;
+		pthread_mutex_unlock(&thpool_p->thcount_lock);
+	} while (count != num_threads);
 
 	return thpool_p;
 }
@@ -202,26 +212,35 @@ void thpool_destroy(thpool_* thpool_p){
 	/* No need to destory if it's NULL */
 	if (thpool_p == NULL) return ;
 
-	volatile int threads_total = thpool_p->num_threads_alive;
-
 	/* End each thread 's infinite loop */
-	threads_keepalive = 0;
+	pthread_mutex_lock (&thpool_p->thcount_lock);
+	volatile int threads_total = thpool_p->num_threads_alive;
+	thpool_p->threads_keepalive = 0;
+	pthread_mutex_unlock (&thpool_p->thcount_lock);
 	
 	/* Give one second to kill idle threads */
 	double TIMEOUT = 1.0;
 	time_t start, end;
 	double tpassed = 0.0;
 	time (&start);
-	while (tpassed < TIMEOUT && thpool_p->num_threads_alive){
+
+	int remaining = threads_total;
+	while (tpassed < TIMEOUT && remaining){
 		bsem_post_all(thpool_p->jobqueue_p->has_jobs);
 		time (&end);
 		tpassed = difftime(end,start);
+		pthread_mutex_lock (&thpool_p->thcount_lock);
+		remaining = thpool_p->num_threads_alive;
+		pthread_mutex_unlock (&thpool_p->thcount_lock);
 	}
 	
 	/* Poll remaining threads */
-	while (thpool_p->num_threads_alive){
+	while (remaining){
 		bsem_post_all(thpool_p->jobqueue_p->has_jobs);
 		sleep(1);
+		pthread_mutex_lock (&thpool_p->thcount_lock);
+		remaining = thpool_p->num_threads_alive;
+		pthread_mutex_unlock (&thpool_p->thcount_lock);
 	}
 
 	/* Job queue cleanup */
@@ -249,7 +268,9 @@ void thpool_pause(thpool_* thpool_p) {
 
 /* Resume all threads in threadpool */
 void thpool_resume(thpool_* thpool_p) {
-	threads_on_hold = 0;
+	pthread_mutex_lock (&thpool_p->thcount_lock);
+	thpool_p->threads_on_hold = 0;
+	pthread_mutex_unlock (&thpool_p->thcount_lock);
 }
 
 
@@ -284,10 +305,25 @@ static int thread_init (thpool_* thpool_p, struct thread** thread_p, int id){
 
 /* Sets the calling thread on hold */
 static void thread_hold () {
-	threads_on_hold = 1;
-	while (threads_on_hold){
-		sleep(1);
+	pthread_mutex_lock (&threads_global_mtx);
+
+	int i = 0;
+	for (i = 0; i < thpool_count; i++) {
+		pthread_mutex_lock (&pools[i]->thcount_lock);
+		pools[i]->threads_on_hold = 1;
+		pthread_mutex_unlock (&pools[i]->thcount_lock);
 	}
+
+	while (1) {
+		int value = 0;
+		pthread_mutex_lock (&pools[i]->thcount_lock);
+		value += pools[i]->threads_on_hold;
+		pthread_mutex_unlock (&pools[i]->thcount_lock);
+		if (!value) break;
+		sleep (1);
+	}
+
+	pthread_mutex_unlock (&threads_global_mtx);
 }
 
 
@@ -331,11 +367,14 @@ static void* thread_do(struct thread* thread_p){
 	thpool_p->num_threads_alive += 1;
 	pthread_mutex_unlock(&thpool_p->thcount_lock);
 
-	while(threads_keepalive){
+	while(1){
 
 		bsem_wait(thpool_p->jobqueue_p->has_jobs);
+		pthread_mutex_lock (&thpool_p->thcount_lock);
+		int ka = thpool_p->threads_keepalive;
+		pthread_mutex_unlock (&thpool_p->thcount_lock);
 
-		if (threads_keepalive){
+		if (ka){
 			
 			pthread_mutex_lock(&thpool_p->thcount_lock);
 			thpool_p->num_threads_working++;
@@ -362,6 +401,8 @@ static void* thread_do(struct thread* thread_p){
 			}
 			pthread_mutex_unlock(&thpool_p->thcount_lock);
 
+		} else {
+			break;
 		}
 	}
 	pthread_mutex_lock(&thpool_p->thcount_lock);

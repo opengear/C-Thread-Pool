@@ -16,6 +16,7 @@ extern "C" {
 
 typedef struct thpool_* threadpool;
 
+void thpool_global_init ();
 
 /**
  * @brief  Initialize threadpool
